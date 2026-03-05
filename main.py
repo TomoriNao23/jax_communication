@@ -4,26 +4,28 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, Mesh, PartitionSpec as P
+
 # =====================================
-# 主程序
+# 主程序（单卡版：用1张卡模拟6个tile）
 # =====================================
 def main():
+    ntile    = 6
     halo     = 3
     nx       = 192
     ny       = 192
-    ntile    = 6
-    px, py   = 1, 1
-
+    pdev, px, py   = 1, 1, 1
     nx_local = nx // px
     ny_local = ny // py
 
-    print(f"可用设备数: {len(jax.devices())}")
+    ndev      = len(jax.devices())
+    assert ndev == pdev
 
-    devices     = np.array(jax.devices()[:ntile]).reshape(ntile, 1, 1)
+    # tile轴直接用实际设备数，1卡时tile=1，6卡时tile=6
+    devices     = np.array(jax.devices()).reshape(pdev, 1, 1)
     mesh        = Mesh(devices, ('tile', 'x', 'y'))
     sharding_2d = NamedSharding(mesh, P('tile', 'x', 'y'))
 
-    # 使用类配置方式初始化 Global2Local 和 HaloExchange（不再实例化对象）
+    # 使用类配置方式初始化 Global2Local 和 HaloExchange
     Global2Local.configure(sharding_2d, halo, nx_local, ny_local)
     HaloExchange.configure(halo, nx_local, ny_local, mesh)
 
@@ -54,18 +56,18 @@ def main():
         ("Tile 2 W halo ← Tile 1 E (期望 2.0)", 2, (slice(h,-h), slice(None,h)),  2.0),
         ("Tile 3 W halo ← Tile 2 E (期望 3.0)", 3, (slice(h,-h), slice(None,h)),  3.0),
     ]
+
     all_pass = True
     for desc, tile, slices, expected in checks:
-        region = u_final[tile][slices]
+        region   = u_final[tile][slices]
         mean_val = float(jnp.mean(region))
-        ok = jnp.allclose(region, expected)
-        status = "✓" if ok else "✗"
+        ok       = jnp.allclose(region, expected)
+        status   = "✓" if ok else "✗"
         print(f"  {status} {desc}: mean={mean_val:.4f}")
         if not ok:
             all_pass = False
 
     print(f"\n{'所有验证通过 ✓' if all_pass else '存在失败项 ✗'}")
-
 
 if __name__ == "__main__":
     main()
