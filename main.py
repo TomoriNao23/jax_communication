@@ -1,4 +1,4 @@
-from communication import HaloExchange
+from communication import Communication
 from gpu_mesh import Global2Local
 import jax
 import jax.numpy as jnp
@@ -25,10 +25,10 @@ def main():
     mesh        = Mesh(devices, ('tile', 'x', 'y'))
     sharding_2d = NamedSharding(mesh, P('tile', 'x', 'y'))
 
-    # 使用类配置方式初始化 Global2Local 和 HaloExchange
+    # 使用类配置方式初始化 Global2Local 和 Communication
     Global2Local.configure(sharding_2d, halo, nx_local, ny_local)
-    HaloExchange.configure(halo, nx_local, ny_local, mesh)
-    HaloExchange.print_schedule_info()
+    Communication.configure(halo, nx_local, ny_local, mesh)
+    Communication.print_schedule_info()
 
     # 每个 tile 填充常数 (i+1)
     u_global = jnp.zeros((ntile,nx,ny),dtype=jnp.float64)
@@ -47,7 +47,7 @@ def main():
     # vars = u_dist[:, 2, 3]
     # print(jax.device_get(vars))
 
-    u_final = HaloExchange.exchange(u_dist)
+    u_final = Communication.update_domain(u_dist)
     v_final = u_final ** 2
 
     sum_per_tile = jnp.sum(u_final, axis=(1, 2))
@@ -56,14 +56,14 @@ def main():
     #vars1, vars2 = u_dist[0, 3, 3], v_final[0, 3, 3]
     #print(jax.device_get(vars1), jax.device_get(vars2))
 
-    u_final, v_final = HaloExchange.boundary_communication(u_final, v_final)
+    u_final, v_final = Communication.boundary_communication(u_final, v_final)
     u_final.block_until_ready()
 
     sum_per_tile = jnp.sum(u_final, axis=(1, 2))
     sum_per_tile_host = jax.device_get(sum_per_tile)
     print(sum_per_tile_host)
-    # vars1, vars2 = u_final[0, 3, 3], v_final[0, 3, 3]
-    # print(jax.device_get(vars1), jax.device_get(vars2))
+    vars1, vars2 = u_final[0, 3, 3], v_final[0, 3, 3]
+    print(jax.device_get(vars1), jax.device_get(vars2))
 
     
 
