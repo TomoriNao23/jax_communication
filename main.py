@@ -6,7 +6,7 @@ import numpy as np
 from jax.sharding import NamedSharding, Mesh, PartitionSpec as P
 
 # =====================================
-# 主程序（单卡版：用1张卡模拟6个tile）
+# 主程序（单卡版：用1或6张卡模拟6个tile）
 # =====================================
 def main():
     ntile    = 6
@@ -35,7 +35,7 @@ def main():
     tile = jnp.arange(ntile)[:,None,None]
     i_idx = jnp.arange(ny)[None,:, None]
     j_idx = jnp.arange(nx)[None,None,:]
-    u_global = (tile + 1) * 10000 + i_idx * 100 + j_idx
+    u_global = ((tile + 1) * 10000 + i_idx * 100 + j_idx) * 1
     # 直接通过类方法完成分发
     u_dist  = Global2Local.distribute(u_global)
     print(u_global.shape,u_dist.shape)
@@ -48,11 +48,22 @@ def main():
     # print(jax.device_get(vars))
 
     u_final = HaloExchange.exchange(u_dist)
+    v_final = u_final ** 2
+
+    sum_per_tile = jnp.sum(u_final, axis=(1, 2))
+    sum_per_tile_host = jax.device_get(sum_per_tile)
+    print(sum_per_tile_host)
+    #vars1, vars2 = u_dist[0, 3, 3], v_final[0, 3, 3]
+    #print(jax.device_get(vars1), jax.device_get(vars2))
+
+    u_final, v_final = HaloExchange.boundary_communication(u_final, v_final)
     u_final.block_until_ready()
 
     sum_per_tile = jnp.sum(u_final, axis=(1, 2))
     sum_per_tile_host = jax.device_get(sum_per_tile)
     print(sum_per_tile_host)
+    # vars1, vars2 = u_final[0, 3, 3], v_final[0, 3, 3]
+    # print(jax.device_get(vars1), jax.device_get(vars2))
 
     
 
