@@ -5,291 +5,355 @@ from jax.sharding import Mesh
 
 
 class HaloExchange:
-    """
-    cubed-sphere 拓扑的 halo 交换。
 
-    面布局         [4]
-              [3] [0] [1] [2]
-                  [5]
-
-    物理边 12 条，图着色分 6 轮，每轮 1 次 lax.ppermute。
-
-    数据结构
-    --------
-    EDGES : list[tuple]
-        12 条物理边，每条格式为 (tile_A, dir_A, tile_B, dir_B, transform)。
-        变换均自逆，tile_A/B 可对称使用。
-
-    _rounds : list[tuple]
-        图着色结果，每个元素为 (edges_in_round, perm)。
-        - edges_in_round : 本轮参与通信的边列表
-        - perm           : lax.ppermute 所需的双射置换列表 [(src, dst), ...]
-
-    _schedule : list[list[tuple | None]]
-        路由调度表，_schedule[round_idx][tile_id] 为该 tile 在该轮的路由。
-        - (direction, partner, tid) : 发送/接收方向、通信对端、变换 id
-        - None                      : 本轮不参与通信（IDLE）
-        direction 同时用作 send_dir 和 write_halo_dir（两者对任意边恒相等）。
-    """
-
-    # 方向常量
     E, W, N, S = 0, 1, 2, 3
 
-    # 变换 id
-    ID           = 0   # 恒等
-    TRANS        = 1   # 转置
-    FLIP_I_TRANS = 2   # 列翻转
-    FLIP_J_TRANS = 3   # 行翻转
+    # 简化的 Transform 类别
+    ID = 0
+    FLIP_I_TRANS = 1
 
-    EDGES = [
-        # 赤道带东西环绕
-        (0, E, 1, W, ID),
-        (1, E, 2, W, ID),
-        (2, E, 3, W, ID),
-        (3, E, 0, W, ID),
-        # 赤道面与北极面 4
-        (0, N, 4, S, ID),
-        (1, N, 4, W, TRANS),
-        (2, N, 4, N, FLIP_I_TRANS),
-        (3, N, 4, E, FLIP_J_TRANS),
-        # 赤道面与南极面 5
-        (0, S, 5, N, ID),
-        (1, S, 5, E, TRANS),
-        (2, S, 5, S, FLIP_I_TRANS),
-        (3, S, 5, W, FLIP_J_TRANS),
-    ]
+    ntile = 6
 
-    halo: int         = 0
-    nx_local: int     = 0
-    ny_local: int     = 0
-    ntile: int        = 6
-    _n_pad: int       = 0
-    mesh: Mesh | None = None
-    _rounds           = None
-    _schedule         = None
-    _exchange_jit     = None
+    halo = 0
+    nx_local = 0
+    ny_local = 0
+    _n_pad = 0
 
-    # ------------------------------------------------------------------
-    # 配置入口
-    # ------------------------------------------------------------------
+    mesh = None
+    EDGES = None
+    _rounds = None
+    _schedule = None
+    _exchange_jit = None
+
+    # -------------------------------------------------
+    # transform 判断
+    # -------------------------------------------------
+
     @classmethod
-    def configure(
-        cls,
-        halo: int,
-        nx_local: int,
-        ny_local: int,
-        mesh: Mesh,
-    ) -> None:
-        cls.halo      = halo
-        cls.nx_local  = nx_local
-        cls.ny_local  = ny_local
-        cls.mesh      = mesh
-        cls._n_pad    = max(nx_local, ny_local)
+    def _infer_transform(cls, dA, dB):
 
-        cls._rounds   = cls._color_edges()
+        table = {
+            # 不旋转 (共线拼接面)
+            (cls.E, cls.W): cls.ID,
+            (cls.W, cls.E): cls.ID,
+            (cls.N, cls.S): cls.ID,
+            (cls.S, cls.N): cls.ID,
+
+            # 转置 + 反转边界长度维度 (跨接拼接面)
+            # 在当前六面体展开拓扑中，所有跨接面映射互为逆运算，均使用此变换
+            (cls.E, cls.S): cls.FLIP_I_TRANS,
+            (cls.W, cls.N): cls.FLIP_I_TRANS,
+            (cls.S, cls.E): cls.FLIP_I_TRANS,
+            (cls.N, cls.W): cls.FLIP_I_TRANS,
+        }
+
+        if (dA, dB) not in table:
+            raise ValueError(f"invalid orientation {dA} -> {dB}")
+
+        return table[(dA, dB)]
+
+    # -------------------------------------------------
+    # 生成拓扑
+    # -------------------------------------------------
+
+    @classmethod
+    def _generate_edges(cls):
+
+        edges = []
+
+        for tile in range(cls.ntile):
+
+            if tile % 2 == 0:
+                # real odd
+
+                rules = {
+                    cls.S: ((tile + 4) % 6, cls.E),
+                    cls.E: ((tile + 2) % 6, cls.S),
+                    cls.N: ((tile + 1) % 6, cls.S),
+                    cls.W: ((tile + 5) % 6, cls.E),
+                }
+
+            else:
+                # real even
+
+                rules = {
+                    cls.E: ((tile + 1) % 6, cls.W),
+                    cls.N: ((tile + 2) % 6, cls.W),
+                    cls.W: ((tile + 4) % 6, cls.N),
+                    cls.S: ((tile + 5) % 6, cls.N),
+                }
+
+            for dA, (nb, dB) in rules.items():
+
+                if tile < nb:
+
+                    tid = cls._infer_transform(dA, dB)
+
+                    edges.append((tile, dA, nb, dB, tid))
+
+        return edges
+
+    # -------------------------------------------------
+    # configure
+    # -------------------------------------------------
+
+    @classmethod
+    def configure(cls, halo, nx_local, ny_local, mesh):
+
+        cls.halo = halo
+        cls.nx_local = nx_local
+        cls.ny_local = ny_local
+        cls.mesh = mesh
+        cls._n_pad = max(nx_local, ny_local)
+
+        cls.EDGES = cls._generate_edges()
+
+        cls._rounds = cls._color_edges()
         cls._schedule = cls._build_schedule()
 
         cls._exchange_jit = jax.jit(
-            jax.vmap(cls._exchange_single, axis_name='tile')
+            jax.vmap(cls._exchange_single, axis_name="tile")
         )
 
-    # ------------------------------------------------------------------
-    # 图着色 → _rounds
-    # ------------------------------------------------------------------
+    # -------------------------------------------------
+    # 图着色
+    # -------------------------------------------------
+
     @classmethod
-    def _color_edges(cls) -> list:
+    def _color_edges(cls):
+
         n = len(cls.EDGES)
-        conflicts = [[False] * n for _ in range(n)]
-        for i, (tA1, _, tB1, _, _) in enumerate(cls.EDGES):
-            for j, (tA2, _, tB2, _, _) in enumerate(cls.EDGES):
-                if i != j and {tA1, tB1} & {tA2, tB2}:
-                    conflicts[i][j] = True
 
-        colors = [-1] * n
+        conflicts = [[False]*n for _ in range(n)]
+
+        for i,(a,_,b,_,_) in enumerate(cls.EDGES):
+            for j,(c,_,d,_,_) in enumerate(cls.EDGES):
+
+                if i!=j and {a,b}&{c,d}:
+                    conflicts[i][j]=True
+
+        colors=[-1]*n
+
         for i in range(n):
-            used = {colors[j] for j in range(n) if conflicts[i][j] and colors[j] >= 0}
-            colors[i] = next(c for c in range(n) if c not in used)
 
-        rounds = []
-        for c in range(max(colors) + 1):
-            group = [cls.EDGES[i] for i in range(n) if colors[i] == c]
-            swapped = set()
-            for tA, _, tB, _, _ in group:
-                swapped.add(tA)
-                swapped.add(tB)
-            perm = []
-            for tA, _, tB, _, _ in group:
-                perm += [(tA, tB), (tB, tA)]
-            perm += [(t, t) for t in range(cls.ntile) if t not in swapped]
-            assert sorted(p[0] for p in perm) == list(range(cls.ntile))
-            assert sorted(p[1] for p in perm) == list(range(cls.ntile))
-            rounds.append((group, perm))
+            used={colors[j] for j in range(n)
+                  if conflicts[i][j] and colors[j]>=0}
+
+            c=0
+            while c in used:
+                c+=1
+
+            colors[i]=c
+
+        rounds=[]
+
+        for c in range(max(colors)+1):
+
+            group=[cls.EDGES[i] for i in range(n) if colors[i]==c]
+
+            swapped=set()
+
+            for a,_,b,_,_ in group:
+                swapped.add(a)
+                swapped.add(b)
+
+            perm=[]
+
+            for a,_,b,_,_ in group:
+                perm.append((a,b))
+                perm.append((b,a))
+
+            for t in range(cls.ntile):
+                if t not in swapped:
+                    perm.append((t,t))
+
+            rounds.append((group,perm))
+
         return rounds
 
-    # ------------------------------------------------------------------
-    # 路由表 → _schedule
-    # ------------------------------------------------------------------
+    # -------------------------------------------------
+
     @classmethod
-    def _build_schedule(cls) -> list:
-        schedule = []
-        for group, _ in cls._rounds:
-            round_sched: list = [None] * cls.ntile
-            for tA, dA, tB, dB, tid in group:
-                assert round_sched[tA] is None, f"tile {tA} 在同一轮内被分配了两条边"
-                assert round_sched[tB] is None, f"tile {tB} 在同一轮内被分配了两条边"
-                round_sched[tA] = (dA, tB, tid)
-                round_sched[tB] = (dB, tA, tid)
+    def _build_schedule(cls):
+
+        schedule=[]
+
+        for group,_ in cls._rounds:
+
+            round_sched=[None]*cls.ntile
+
+            for tA,dA,tB,dB,tid in group:
+
+                round_sched[tA]=(dA,tB,tid)
+                round_sched[tB]=(dB,tA,tid)
+
             schedule.append(round_sched)
+
         return schedule
 
-    # ------------------------------------------------------------------
-    # 打包：取 direction 方向的有效数据，padding 到 (h, n_pad)
-    # ------------------------------------------------------------------
-    @classmethod
-    def _pack_edge(cls, u: jnp.ndarray, direction: int) -> jnp.ndarray:
-        h, n = cls.halo, cls._n_pad
-        if direction == cls.E:
-            raw = u[h:-h, -2*h:-h].T
-        elif direction == cls.W:
-            raw = u[h:-h,   h:2*h].T
-        elif direction == cls.N:
-            raw = u[-2*h:-h, h:-h]
-        else:  # S
-            raw = u[  h:2*h, h:-h]
-        cur = raw.shape[1]
-        if cur < n:
-            raw = jnp.concatenate(
-                [raw, jnp.zeros((h, n - cur), dtype=raw.dtype)], axis=1
-            )
-        return raw  # (h, n_pad)
+    # -------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # 变换：(h, n_pad) 缓冲 → 目标 halo 形状
-    #   E/W halo 目标形状 (ny_local, h)
-    #   N/S halo 目标形状 (h, nx_local)
-    # ------------------------------------------------------------------
     @classmethod
-    def _apply_transform(
-        cls,
-        data: jnp.ndarray,
-        recv_dir: int,
-        tid: int,
-    ) -> jnp.ndarray:
-        n = cls.ny_local if recv_dir in (cls.E, cls.W) else cls.nx_local
+    def _pack_edge(cls,u,d):
+
+        h=cls.halo
+        n=cls._n_pad
+
+        if d==cls.E:
+            raw=u[h:-h,-2*h:-h].T
+        elif d==cls.W:
+            raw=u[h:-h,h:2*h].T
+        elif d==cls.N:
+            raw=u[-2*h:-h,h:-h]
+        else:
+            raw=u[h:2*h,h:-h]
+
+        cur=raw.shape[1]
+
+        if cur<n:
+            raw=jnp.concatenate(
+                [raw,jnp.zeros((h,n-cur),dtype=raw.dtype)],axis=1
+            )
+
+        return raw
+
+    # -------------------------------------------------
+
+    @classmethod
+    def _apply_transform(cls, data, recv_dir, tid):
+
+        if recv_dir in (cls.E, cls.W):
+            n = cls.ny_local
+        else:
+            n = cls.nx_local
+
         raw = data[:, :n]
+
+        # --- cubed sphere orientation group ---
 
         if tid == cls.ID:
             t = raw
-        elif tid == cls.TRANS:
-            t = raw.T
+
         elif tid == cls.FLIP_I_TRANS:
-            t = raw[:, ::-1]
-        else:  # FLIP_J_TRANS
-            t = raw[::-1, :]
+            # transpose + reverse boundary length dimension
+            # 保留 halo 深度维度不被翻转
+            t = raw.T[::-1, :]
+
+        else:
+            raise ValueError("invalid transform")
+
+        # --- orient halo correctly ---
 
         if recv_dir in (cls.E, cls.W):
-            return t if tid == cls.TRANS else t.T
+
+            # need (ny_local, h)
+            if t.shape[0] != cls.ny_local:
+                t = t.T
+
         else:
-            return t.T if tid == cls.TRANS else t
 
-    # ------------------------------------------------------------------
-    # 写入 halo：lax.cond 只在 target_tile 上执行 .at[].set()
-    # ------------------------------------------------------------------
+            # need (h, nx_local)
+            if t.shape[0] != cls.halo:
+                t = t.T
+
+        return t
+
+    # -------------------------------------------------
     @classmethod
-    def _write_halo_if_tile(
-        cls,
-        u: jnp.ndarray,
-        recv_data: jnp.ndarray,
-        recv_dir: int,
-        tid: int,
-        target_tile: int,
-        tile_id: jnp.ndarray,
-    ) -> jnp.ndarray:
-        h   = cls.halo
-        arr = cls._apply_transform(recv_data, recv_dir, tid)
+    def _one_round(cls,u,round_idx,perm):
 
-        if recv_dir == cls.E:
-            true_fn = lambda _: u.at[h:-h, -h:].set(arr)
-        elif recv_dir == cls.W:
-            true_fn = lambda _: u.at[h:-h, :h].set(arr)
-        elif recv_dir == cls.N:
-            true_fn = lambda _: u.at[-h:, h:-h].set(arr)
-        else:  # S
-            true_fn = lambda _: u.at[:h, h:-h].set(arr)
+        tile_id=lax.axis_index("tile")
 
-        return lax.cond(tile_id == target_tile, true_fn, lambda _: u, None)
+        h=cls.halo
+        n=cls._n_pad
 
-    # ------------------------------------------------------------------
-    # 单轮交换：按路由表展开，每 tile 只生成 1 次 _pack_edge
-    # ------------------------------------------------------------------
-    @classmethod
-    def _one_round(
-        cls,
-        u: jnp.ndarray,
-        round_idx: int,
-        perm: list,
-    ) -> jnp.ndarray:
-        tile_id     = lax.axis_index('tile')
-        h, n_pad    = cls.halo, cls._n_pad
-        round_sched = cls._schedule[round_idx]
+        sched=cls._schedule[round_idx]
 
-        # 打包：路由表按 tile 展开，_pack_edge 在 lambda 内部
-        send_data = jnp.zeros((h, n_pad), dtype=u.dtype)
+        send=jnp.zeros((h,n),dtype=u.dtype)
+
         for t in range(cls.ntile):
-            entry = round_sched[t]
-            if entry is None:
-                send_data = lax.cond(
-                    tile_id == t,
-                    lambda _: jnp.zeros((h, n_pad), dtype=u.dtype),
-                    lambda _, s=send_data: s,
-                    None,
-                )
-            else:
-                direction, _, _ = entry
-                send_data = lax.cond(
-                    tile_id == t,
-                    lambda _, d=direction: cls._pack_edge(u, d),
-                    lambda _, s=send_data: s,
-                    None,
-                )
 
-        # 通信
-        recv_data = lax.ppermute(send_data, axis_name='tile', perm=perm)
+            entry=sched[t]
 
-        # 写入 halo：IDLE tile 完全跳过
-        for t in range(cls.ntile):
-            entry = round_sched[t]
             if entry is None:
                 continue
-            direction, _, tid = entry
-            u = cls._write_halo_if_tile(u, recv_data, direction, tid, t, tile_id)
+
+            d,_,_=entry
+
+            send=lax.cond(
+                tile_id==t,
+                lambda _:cls._pack_edge(u,d),
+                lambda _:send,
+                None
+            )
+
+        recv=lax.ppermute(send,"tile",perm)
+
+        for t in range(cls.ntile):
+
+            entry=sched[t]
+
+            if entry is None:
+                continue
+
+            d,_,tid=entry
+
+            arr=cls._apply_transform(recv,d,tid)
+
+            def write(_):
+
+                if d==cls.E:
+                    return u.at[h:-h,-h:].set(arr)
+                elif d==cls.W:
+                    return u.at[h:-h,:h].set(arr)
+                elif d==cls.N:
+                    return u.at[-h:,h:-h].set(arr)
+                else:
+                    return u.at[:h,h:-h].set(arr)
+
+            u=lax.cond(tile_id==t,write,lambda _:u,None)
 
         return u
 
-    # ------------------------------------------------------------------
-    # 单 tile 完整交换
-    # ------------------------------------------------------------------
+    # -------------------------------------------------
+
     @classmethod
-    def _exchange_single(cls, u_local: jnp.ndarray) -> jnp.ndarray:
-        for round_idx, (_, perm) in enumerate(cls._rounds):
-            u_local = cls._one_round(u_local, round_idx, perm)
-        return u_local
+    def _exchange_single(cls,u):
 
-    # ------------------------------------------------------------------
-    # 公开接口
-    # ------------------------------------------------------------------
+        for r,(_,perm) in enumerate(cls._rounds):
+            u=cls._one_round(u,r,perm)
+
+        return u
+
+    # -------------------------------------------------
+
     @classmethod
-    def exchange(cls, u: jnp.ndarray) -> jnp.ndarray:
-        """
-        执行全部 tile 的 halo 交换。
+    def exchange(cls,u):
 
-        Args:
-            u: shape = (ntile, nx_local + 2*halo, ny_local + 2*halo)
-
-        Returns:
-            halo 区域已填充的数组，shape 不变。
-        """
-        if cls._exchange_jit is None or cls.mesh is None:
-            raise RuntimeError("HaloExchange 未配置，请先调用 HaloExchange.configure(...)")
         with cls.mesh:
             return cls._exchange_jit(u)
+    
+    # -------------------------------------------------
+    # 打印通信计划 (用于测试和验证)
+    # -------------------------------------------------
+
+    @classmethod
+    def print_schedule_info(cls):
+        """打印每一轮通信的具体面片连接情况"""
+        if cls._rounds is None:
+            print("错误: HaloExchange 尚未配置。请先调用 configure()。")
+            return
+
+        print(f"通信轮次数: {len(cls._rounds)}")
+        
+        # 方向数字到字符的映射
+        dn = {cls.E: 'E', cls.W: 'W', cls.N: 'N', cls.S: 'S'}
+        
+        for i, (edges, _) in enumerate(cls._rounds):
+            # e 的结构是 (tileA, dirA, tileB, dirB, tid)
+            # 转换为 (tileA+1, 方向A, tileB+1, 方向B)
+            round_info = [
+                (e[0] + 1, dn[e[1]], e[2] + 1, dn[e[3]]) 
+                for e in edges
+            ]
+            print(f"  轮{i}: {round_info}")
