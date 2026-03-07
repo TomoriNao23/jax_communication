@@ -15,9 +15,9 @@ def main():
     # 1. 基础配置
     ntile    = 6
     halo     = 3
-    nx       = 384
+    nx       = 1536
     ny       = nx
-    pdev, px, py   = 1, 1, 1
+    pdev, px, py   = 6, 1, 1
     nx_local = nx // px
     ny_local = ny // py
 
