@@ -4,23 +4,27 @@ from jax import lax
 from jax.sharding import Mesh
 
 # ==========================================
-# 1. 拓扑类 (Topology)
+# 1. Topology Class
 # ==========================================
 class Topology:
     """
-    负责处理网格的拓扑连接规则，内置方向和旋转常量配置。
+    Responsible for handling the topology connection rules of the grid, 
+    with built-in direction and rotation constant configurations.
     """
-    # 方向常量
+    # Direction constants (East, West, North, South)
     E, W, N, S = 0, 1, 2, 3
-    # 变换规则常量
-    ID = 0
-    FLIP_I_TRANS = 1
     
-    NTILE = 6
+    # Transformation rule constants
+    ID = 0              # Identity (no transformation)
+    FLIP_I_TRANS = 1    # Flip and transpose
+    
+    NTILE = 6           # Number of tiles (e.g., for a cubed-sphere grid)
 
     @classmethod
     def get_transform(cls, dir_a, dir_b):
-        """判断两个相邻面拼接时的数据转换规则"""
+        """
+        Determines the data transformation rule when joining two adjacent faces.
+        """
         table = {
             (cls.E, cls.W): cls.ID,
             (cls.W, cls.E): cls.ID,
@@ -36,10 +40,13 @@ class Topology:
 
     @classmethod
     def generate_edges(cls):
-        """生成拓扑边：记录面上相互连接的几何规则"""
+        """
+        Generates topological edges: records the geometric rules of interconnected faces.
+        Returns a list of tuples: (tile_A, dir_A, tile_B, dir_B, transform_id).
+        """
         edges = []
         for tile in range(cls.NTILE):
-            # 抽象奇偶面相邻规则
+            # Abstract adjacency rules for even and odd faces on a cubed sphere
             if tile % 2 == 0:  
                 rules = {
                     cls.S: ((tile + 4) % 6, cls.E),
@@ -55,8 +62,9 @@ class Topology:
                     cls.S: ((tile + 5) % 6, cls.N),
                 }
 
-            # 生成 nsew 旋转规则及拓扑连接边
+            # Generate NSEW rotation rules and topological connection edges
             for d_a, (nb, d_b) in rules.items():
+                # Only add the edge if tile < nb to avoid duplicating bidirectional edges
                 if tile < nb:
                     tid = cls.get_transform(d_a, d_b)
                     edges.append((tile, d_a, nb, d_b, tid))
@@ -64,17 +72,23 @@ class Topology:
 
 
 # ==========================================
-# 2. 贪心图着色类 (GreedyColoring)
+# 2. GreedyColoring Class
 # ==========================================
 class GreedyColoring:
-    """处理通信依赖与冲突的调度器"""
+    """
+    Scheduler handling communication dependencies and conflicts using graph coloring.
+    """
     
     @staticmethod
     def color_edges(edges, ntile):
-        """将边分配到不冲突的轮次中"""
+        """
+        Allocates edges to conflict-free rounds so that no tile communicates
+        simultaneously in multiple directions.
+        """
         n = len(edges)
         conflicts = [[False] * n for _ in range(n)]
 
+        # Determine conflicts: edges conflict if they share a tile
         for i, (a, _, b, _, _) in enumerate(edges):
             for j, (c, _, d, _, _) in enumerate(edges):
                 if i != j and {a, b} & {c, d}:
@@ -93,9 +107,10 @@ class GreedyColoring:
             group = [edges[i] for i in range(n) if colors[i] == c]
             swapped = {t for edge in group for t in (edge[0], edge[2])}
 
+            # Create permutation map for jax.lax.ppermute
             perm = [(a, b) for a, _, b, _, _ in group] + [(b, a) for a, _, b, _, _ in group]
             
-            # 未参与交换的 tile 指向自己
+            # Tiles not participating in the exchange point to themselves
             perm.extend([(t, t) for t in range(ntile) if t not in swapped])
             rounds.append((group, perm))
 
@@ -103,7 +118,9 @@ class GreedyColoring:
 
     @staticmethod
     def build_schedule(rounds, ntile):
-        """生成并格式化每轮每个 tile 的详细收发计划表"""
+        """
+        Generates and formats a detailed send/receive schedule for each tile in each round.
+        """
         schedule = []
         for group, _ in rounds:
             round_sched = [None] * ntile
@@ -115,12 +132,14 @@ class GreedyColoring:
 
 
 # ==========================================
-# 3. 通信类 (Communication)
+# 3. Communication Class
 # ==========================================
 class Communication:
-    """负责处理域内 Update 与边界均值同步的通信核心"""
+    """
+    Communication core responsible for domain updates and boundary mean synchronization.
+    """
     
-    # C网格特有的物理棱线通信指标配置
+    # Physical edge communication index configuration specific to C-grids
     IDX_W = 3
     IDX_E = -3
     IDX_S = 3
@@ -150,6 +169,7 @@ class Communication:
         cls._rounds = GreedyColoring.color_edges(edges, Topology.NTILE)
         cls._schedule = GreedyColoring.build_schedule(cls._rounds, Topology.NTILE)
 
+        # Vectorize over the 'tile' axis and JIT compile the update functions
         cls._update_domain_jit = jax.jit(
             jax.vmap(cls._update_domain_single, axis_name="tile")
         )
@@ -159,11 +179,13 @@ class Communication:
         )
 
     # -------------------------------------------------
-    # 共享逻辑 
+    # Shared Logic
     # -------------------------------------------------
     @classmethod
     def _apply_transform(cls, data, recv_dir, tid):
-        """统一的数据旋转/翻转应用层"""
+        """
+        Unified data rotation/flip application layer.
+        """
         is_ew = recv_dir in (Topology.E, Topology.W)
         n = cls.ny_local if is_ew else cls.nx_local
         raw = data[:, :n]
@@ -177,18 +199,23 @@ class Communication:
         return t
 
     # -------------------------------------------------
-    # Domain Update
+    # Domain Update (Halo Exchange)
     # -------------------------------------------------
     @classmethod
     def _pack_edge(cls, u, d):
+        """Extracts the boundary data to be sent based on the direction."""
         h, n = cls.halo, cls._n_pad
 
-        if d == Topology.E:   raw = u[h:-h, -2*h:-h].T
-        elif d == Topology.W: raw = u[h:-h, h:2*h].T
-        elif d == Topology.N: raw = u[-2*h:-h, h:-h]
-        else:                 raw = u[h:2*h, h:-h]
+        if d == Topology.E:   
+            raw = u[h:-h, -2*h:-h].T
+        elif d == Topology.W: 
+            raw = u[h:-h, h:2*h].T
+        elif d == Topology.N: 
+            raw = u[-2*h:-h, h:-h]
+        else:                 
+            raw = u[h:2*h, h:-h]
 
-        # 【优化】使用 jnp.pad 替代 concatenate，XLA 编译更友好
+        # [Optimization] Use jnp.pad instead of concatenate for better XLA compilation friendliness
         cur = raw.shape[1]
         if cur < n:
             raw = jnp.pad(raw, ((0, 0), (0, n - cur)))
@@ -196,6 +223,7 @@ class Communication:
 
     @classmethod
     def _update_domain_round(cls, u, round_idx, perm):
+        """Executes a single communication round for domain updating."""
         tile_id = lax.axis_index("tile")
         h, n = cls.halo, cls._n_pad
         sched = cls._schedule[round_idx]
@@ -207,6 +235,7 @@ class Communication:
             if entry is None: continue
             d, _, _ = entry
             
+            # Conditionally pack the edge if the current tile matches
             send = lax.cond(
                 tile_id == t,
                 lambda _: cls._pack_edge(u, d),
@@ -214,6 +243,7 @@ class Communication:
                 None
             )
 
+        # Cross-device communication using permutations based on graph coloring
         recv = lax.ppermute(send, "tile", perm)
 
         for t in range(Topology.NTILE):
@@ -234,30 +264,37 @@ class Communication:
 
     @classmethod
     def _update_domain_single(cls, u):
+        """Applies all communication rounds sequentially for a single array."""
         for r, (_, perm) in enumerate(cls._rounds):
             u = cls._update_domain_round(u, r, perm)
         return u
 
     @classmethod
     def update_domain(cls, u):
+        """Public API to trigger domain update within the defined Mesh."""
         with cls.mesh:
             return cls._update_domain_jit(u)
 
     # -------------------------------------------------
-    # C 网格边界棱线同步
+    # C-Grid Boundary Edge Synchronization
     # -------------------------------------------------
     @classmethod
     def _pack_boundary_edge(cls, u, v, d):
+        """Extracts boundary lines for U/V vector fields based on direction."""
         h, n = cls.halo, cls._n_pad
 
-        if d == Topology.E:   line = v[h:-h, cls.IDX_E]
-        elif d == Topology.W: line = v[h:-h, cls.IDX_W]
-        elif d == Topology.N: line = u[cls.IDX_N, h:-h]
-        else:                 line = u[cls.IDX_S, h:-h]
+        if d == Topology.E:   
+            line = v[h:-h, cls.IDX_E]
+        elif d == Topology.W: 
+            line = v[h:-h, cls.IDX_W]
+        elif d == Topology.N: 
+            line = u[cls.IDX_N, h:-h]
+        else:                 
+            line = u[cls.IDX_S, h:-h]
 
         raw = jnp.zeros((h, len(line)), dtype=u.dtype).at[0, :].set(line)
 
-        # 【优化】使用 jnp.pad 替代 concatenate
+        # [Optimization] Use jnp.pad instead of concatenate
         cur = raw.shape[1]
         if cur < n:
             raw = jnp.pad(raw, ((0, 0), (0, n - cur)))
@@ -265,6 +302,7 @@ class Communication:
 
     @classmethod
     def _boundary_communication_round(cls, u, v, round_idx, perm):
+        """Executes a single boundary synchronization round."""
         tile_id = lax.axis_index("tile")
         h, n = cls.halo, cls._n_pad
         sched = cls._schedule[round_idx]
@@ -283,6 +321,7 @@ class Communication:
                 None
             )
 
+        # Cross-device exchange
         recv = lax.ppermute(send, "tile", perm)
 
         for t in range(Topology.NTILE):
@@ -292,6 +331,7 @@ class Communication:
             arr = cls._apply_transform(recv, d, tid)
 
             def write(_):
+                # Calculate mean of the local and received edges
                 if d == Topology.E:
                     val = ((v[h:-h, cls.IDX_E] + arr[:, 0]) / 2.0).astype(v.dtype)
                     return u, v.at[h:-h, cls.IDX_E].set(val)
@@ -311,27 +351,31 @@ class Communication:
 
     @classmethod
     def _boundary_communication_single(cls, u, v):
+        """Applies all boundary sync rounds sequentially."""
         for r, (_, perm) in enumerate(cls._rounds):
             u, v = cls._boundary_communication_round(u, v, r, perm)
         return u, v
 
     @classmethod
     def boundary_communication(cls, u, v):
+        """Public API to trigger boundary synchronization within the defined Mesh."""
         with cls.mesh:
             return cls._boundary_communication_jit(u, v)
     
     # -------------------------------------------------
-    # 打印调度
+    # Print Scheduling Info
     # -------------------------------------------------
     @classmethod
     def print_schedule_info(cls):
+        """Prints the calculated topology schedules and rounds."""
         if cls._rounds is None:
-            print("错误: Communication 尚未配置。请先调用 configure()。")
+            print("Error: Communication is not yet configured. Please call configure() first.")
             return
 
-        print(f"通信轮次数: {len(cls._rounds)}")
+        print(f"Number of communication rounds: {len(cls._rounds)}")
         dn = {Topology.E: 'E', Topology.W: 'W', Topology.N: 'N', Topology.S: 'S'}
         
         for i, (edges, _) in enumerate(cls._rounds):
+            # Display: (Tile_A, Dir_A, Tile_B, Dir_B) with 1-based indexing for readability
             round_info = [(e[0] + 1, dn[e[1]], e[2] + 1, dn[e[3]]) for e in edges]
-            print(f"  轮{i}: {round_info}")
+            print(f"  Round {i}: {round_info}")
